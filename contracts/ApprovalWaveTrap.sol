@@ -1,57 +1,121 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.19;
 
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+contract ApprovalTrap {
+    uint256 public constant THRESHOLD = 5;
+    uint256 public constant WINDOW_BLOCKS = 10;
 
-/**
- * @title ApprovalWaveTrap
- * @author Gemini
- * @notice A Drosera trap to detect suspicious, high-value ERC20 approvals.
- *
- * The `check` function is designed to be called by Drosera operators.
- * Operators will monitor ERC20 `Approval` events off-chain and use the event
- * parameters (`owner`, `spender`, `value`) to call this function.
- *
- * The trap is considered "sprung" (returns true) if:
- * 1. The approval value is excessively large (greater than half of a uint255).
- * 2. The spender address is NOT a known, whitelisted contract.
- */
-contract ApprovalWaveTrap {
+    // Uniswap V3 Router (mainnet address) — treated as whitelist in PoC
+    address public constant UNISWAP_V3_ROUTER = 0xE592427A0AEce92De3Edee1F18E0157C05861564;
 
-    // A testnet WETH contract. This can be any major ERC20 token you wish to monitor.
-    // Hoodi Testnet Wrapped Ether (WETH)
-    address public constant TARGET_TOKEN = 0x2424FE754e388b6a32CeC12744A39d51A6e340aA;
+    address public owner;
+    mapping(address => bool) public trustedSpender; // extra whitelists
+    mapping(address => uint256[]) internal approvalBlocks;
+    mapping(address => bytes32[]) internal approvalTxHashes;
 
-    // Uniswap's Universal Router - a common, trusted spender.
-    // On mainnet, this is 0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD. We use a placeholder for Hoodi.
-    // For this PoC, we will use a known address on Hoodi as a stand-in.
-    // Example: A known contract from the Hoodi block explorer.
-    address public constant WHITELISTED_SPENDER = 0x183D78491555cb69B68d2354F7373cc2632508C7; // Placeholder
+    event ApprovalObserved(
+        address indexed token,
+        address indexed origin,
+        address indexed spender,
+        bytes32 txHash,
+        uint256 blockNumber,
+        address reporter
+    );
 
-    // A very high approval amount, often a sign of a malicious "infinite approve" trick.
-    uint256 public constant APPROVAL_THRESHOLD = 0.5 * 1e76; // Approx. type(uint255).max / 2
+    event ApprovalWaveAlert(
+        address indexed origin,
+        address indexed spender,
+        uint256 count,
+        bytes32 quote,
+        bytes32[] evidenceTxHashes,
+        uint256[] evidenceBlocks
+    );
 
-    /**
-     * @notice Checks if a specific approval is suspicious.
-     * @param owner The address that granted the approval.
-     * @param spender The address that received the approval.
-     * @return a boolean indicating if the trap condition is met.
-     *
-     * Note: This function relies on the *current* on-chain allowance, which reflects
-     * the state set by the `Approval` event the operator just witnessed.
-     */
-    function check(address owner, address spender) external view returns (bool) {
-        // Condition 1: The spender must not be a known-good contract.
-        if (spender == WHITELISTED_SPENDER) {
-            return false;
+    modifier onlyOwner() {
+        require(msg.sender == owner, "only owner");
+        _;
+    }
+
+    // no constructor args — set deployer as owner
+    constructor() {
+        owner = msg.sender;
+    }
+
+    function setTrustedSpender(address spender, bool trusted) external onlyOwner {
+        trustedSpender[spender] = trusted;
+    }
+
+    /// @notice Report an observed approve() call
+    function reportApproval(
+        address token,
+        address origin,
+        address spender,
+        bytes32 txHash
+    ) external {
+        emit ApprovalObserved(token, origin, spender, txHash, block.number, msg.sender);
+
+        // ignore whitelisted spenders
+        if (spender == UNISWAP_V3_ROUTER || trustedSpender[spender]) {
+            return;
         }
 
-        // Condition 2: The allowance granted must exceed the defined threshold.
-        uint256 currentAllowance = IERC20(TARGET_TOKEN).allowance(owner, spender);
-        if (currentAllowance > APPROVAL_THRESHOLD) {
-            return true;
-        }
+        approvalBlocks[origin].push(block.number);
+        approvalTxHashes[origin].push(txHash);
 
-        return false;
+        _pruneOld(origin);
+
+        uint256 cnt = approvalBlocks[origin].length;
+        if (cnt >= THRESHOLD) {
+            uint256 len = approvalBlocks[origin].length;
+            bytes32[] memory evidenceHashes = new bytes32[](len);
+            uint256[] memory evidenceBlocks = new uint256[](len);
+
+            for (uint256 i = 0; i < len; i++) {
+                evidenceHashes[i] = approvalTxHashes[origin][i];
+                evidenceBlocks[i] = approvalBlocks[origin][i];
+            }
+
+            // deterministic quote (support citation)
+            bytes32 quote = keccak256(
+                abi.encodePacked(origin, spender, cnt, block.number, evidenceHashes, evidenceBlocks, block.timestamp)
+            );
+
+            emit ApprovalWaveAlert(origin, spender, cnt, quote, evidenceHashes, evidenceBlocks);
+        }
+    }
+
+    function getApprovalEvidence(address origin) external view returns (uint256[] memory, bytes32[] memory) {
+        return (approvalBlocks[origin], approvalTxHashes[origin]);
+    }
+
+    function countApprovalsInWindow(address origin) public view returns (uint256) {
+        uint256[] storage arr = approvalBlocks[origin];
+        if (arr.length == 0) return 0;
+        uint256 minAllowed = block.number > WINDOW_BLOCKS ? block.number - WINDOW_BLOCKS + 1 : 0;
+        uint256 c = 0;
+        for (uint256 i = 0; i < arr.length; i++) {
+            if (arr[i] >= minAllowed) c++;
+        }
+        return c;
+    }
+
+    function _pruneOld(address origin) internal {
+        uint256 len = approvalBlocks[origin].length;
+        if (len == 0) return;
+        uint256 minAllowed = block.number > WINDOW_BLOCKS ? block.number - WINDOW_BLOCKS + 1 : 0;
+        uint256 keepFrom = 0;
+        while (keepFrom < len && approvalBlocks[origin][keepFrom] < minAllowed) {
+            keepFrom++;
+        }
+        if (keepFrom == 0) return;
+        uint256 newLen = len - keepFrom;
+        for (uint256 i = 0; i < newLen; i++) {
+            approvalBlocks[origin][i] = approvalBlocks[origin][i + keepFrom];
+            approvalTxHashes[origin][i] = approvalTxHashes[origin][i + keepFrom];
+        }
+        for (uint256 i = 0; i < keepFrom; i++) {
+            approvalBlocks[origin].pop();
+            approvalTxHashes[origin].pop();
+        }
     }
 }
