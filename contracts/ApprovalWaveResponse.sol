@@ -1,56 +1,48 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.19;
 
-/**
- * @title ApprovalWaveResponse
- * @author Gemini
- * @notice This contract logs suspicious activity detected by the ApprovalWaveTrap.
- * Its `logSuspiciousActivity` function is called by the Drosera network when
- * the corresponding trap is triggered.
- */
-contract ApprovalWaveResponse {
+contract ApprovalResponse {
+    uint256 public constant THRESHOLD = 5;
+    uint256 public constant WINDOW_BLOCKS = 10;
+    address public owner;
 
-    // The address of the Drosera network contract on the Hoodi testnet.
-    // This ensures only the Drosera network can call the response function.
-    address public constant DROSERA_CONTRACT = 0x91cB447BaFc6e0EA0F4Fe056F5a9b1F14bb06e5D;
+    address public constant UNISWAP_V3_ROUTER = 0xE592427A0AEce92De3Edee1F18E0157C05861564;
+    mapping(address => bool) public trustedSpender;
 
-    /**
-     * @dev An event to create an on-chain log of the suspicious activity.
-     * @param owner The address that granted the suspicious approval.
-     * @param spender The address of the contract that received the approval.
-     * @param detectedAt The timestamp of the detection.
-     */
-    event SuspiciousApprovalDetected(
-        address indexed owner,
-        address indexed spender,
-        uint256 detectedAt
-    );
+    constructor() {
+        owner = msg.sender;
+    }
 
-    // Public state variables to easily verify a successful trap execution.
-    address public lastSuspiciousOwner;
-    address public lastSuspiciousSpender;
-    uint256 public lastDetectionTimestamp;
-    uint public detectionCount;
-
-    modifier onlyDrosera() {
-        require(msg.sender == DROSERA_CONTRACT, "Caller is not the Drosera network");
+    modifier onlyOwner() {
+        require(msg.sender == owner, "only owner");
         _;
     }
 
-    /**
-     * @notice The response function called by Drosera operators.
-     * @param owner The address of the EOA that made the suspicious approval.
-     * @param spender The address of the contract that received the approval.
-     *
-     * This function's signature "logSuspiciousActivity(address,address)" must
-     * match the one specified in the drosera.toml file.
-     */
-    function logSuspiciousActivity(address owner, address spender) external onlyDrosera {
-        lastSuspiciousOwner = owner;
-        lastSuspiciousSpender = spender;
-        lastDetectionTimestamp = block.timestamp;
-        detectionCount++;
+    function setTrustedSpender(address spender, bool trusted) external onlyOwner {
+        trustedSpender[spender] = trusted;
+    }
 
-        emit SuspiciousApprovalDetected(owner, spender, block.timestamp);
+    /// @notice Evaluate evidence, return (shouldRespond, quote)
+    function shouldRespond(
+        address origin,
+        address spender,
+        bytes32[] calldata evidenceTxHashes,
+        uint256[] calldata evidenceBlocks
+    ) external view returns (bool, bytes32) {
+        if (spender == UNISWAP_V3_ROUTER || trustedSpender[spender]) {
+            return (false, bytes32(0));
+        }
+        if (evidenceTxHashes.length != evidenceBlocks.length) {
+            return (false, bytes32(0));
+        }
+
+        uint256 minAllowed = block.number > WINDOW_BLOCKS ? block.number - WINDOW_BLOCKS + 1 : 0;
+        uint256 cnt = 0;
+        for (uint256 i = 0; i < evidenceBlocks.length; i++) {
+            if (evidenceBlocks[i] >= minAllowed) cnt++;
+        }
+
+        bytes32 quote = keccak256(abi.encodePacked(origin, spender, cnt, block.number, evidenceTxHashes, evidenceBlocks));
+        return (cnt >= THRESHOLD, quote);
     }
 }
