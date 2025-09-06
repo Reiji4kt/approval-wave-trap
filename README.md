@@ -1,6 +1,6 @@
 # approval-wave-trap
 ApprovalTrap
-Got it — here’s the same updated `README.md`, but stripped clean of the emojis so it reads more professional and minimal:
+
 
 ---
 
